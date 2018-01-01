@@ -1,6 +1,103 @@
-﻿using namespace System.Collections.Generic
+using namespace System.Collections.Generic
 using namespace System.IO
 
+function Get-VSProductType {
+  param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0")]
+    [Alias("v")]
+    [String]
+    $Version,
+    [Parameter(Mandatory=$true)]
+    [ValidateScript({Test-Path $_})]
+    [Alias("p")]
+    [String]
+    $Directory
+    )
+  
+  If ($Version -match "15.0") {
+    $tdir = [Path]::GetFileName($Directory)
+    $detected_product = If (@("Professional", "BuildTools", "Enterprise", "Community") -contains $tdir) { $tdir } Else { "BuildTools" }
+    return $detected_product
+  }
+    $ddiv_path = (Join-Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\DevDiv\vs\Servicing" $Version)
+    
+    return $( If (Test-Path (Join-Path $ddiv_path "enterprise")) { "Enterprise" } 
+                        ElseIf (Test-Path (Join-Path $ddiv_path "premium")) { "Enterprise" } 
+                        ElseIf (Test-Path (Join-Path $ddiv_path "ultimate")) { "Enterprise" } 
+                        ElseIf (Test-Path (Join-Path $ddiv_path "professional")) { "Professional" } 
+                        ElseIf (Test-Path (Join-Path $ddiv_path "community")) { "Community" } 
+                        Else { "BuildTools" })
+}
+
+function Get-VSVersionInfo {
+  $vs_sxs = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\SxS\VS7"
+  $valid_vs_vers = $("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0")
+  $versions = @()
+  Get-Item $vs_sxs `
+  | Select-Object -ExpandProperty property `
+  | Where-Object { ($valid_vs_vers -contains $_) -and ($(try {Test-Path (Get-ItemPropertyValue $vs_sxs $_) } catch {$false})) } `
+  | Foreach-Object { 
+      $tpath = $(Get-ItemPropertyValue $vs_sxs $_)
+      $tver = $_
+      $tprod = (Get-VSProductType -Version $tver -Directory $tpath)
+      $versions += New-Object PSObject -Property @{ Version = $tver; InstallationPath = $tpath ; Source = $vs_sxs; Product = $tprod } 
+  } 
+  
+  $valid_vs_vers `
+  | Where-Object { ($versions.Version -notcontains $_) -and ($(try {Test-Path([System.Environment]::GetEnvironmentVariable("VS" + $_.TrimEnd(".0") + "0COMNTOOLS"))} catch {$false})) } `
+  | Foreach-Object { 
+    $tsrc = "VS" + $_.TrimEnd(".0") + "0COMNTOOLS"
+    $tpath = [System.Environment]::GetEnvironmentVariable($tsrc)
+    while (@("Common7", "Tools") -contains (Split-Path $tpath -leaf)) { $tpath = (Split-Path $tpath -Parent) }
+    $versions += New-Object PSObject -Property @{ Version = $_; InstallationPath = $tpath; Source = $tsrc; Product = "BuildTools" } 
+  } 
+  $versions = $versions | sort {[float]$_.Version} | Get-Unique
+  return $versions
+}
+<#
+  .SYNOPSIS
+    Returns a list of all installed Visual Studio versions
+#>
+function Find-VSVersions {
+  [CmdletBinding(DefaultParameterSetName="All")]
+  param(
+    [Alias("l")]
+    [Switch]
+    $Latest = $false
+  )
+  
+  <#
+  $vs_sxs = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\SxS\VS7"
+  $valid_vs_vers = $("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0")
+  $versions = [List[String]]::new()
+  Get-Item $vs_sxs `
+  | Select-Object -ExpandProperty property `
+  | Where-Object { ($valid_vs_vers -contains $_) -and ($(try {Test-Path (Get-ItemProperty -Path $vs_sxs -Name $_).$_ } catch {$false})) } `
+  | Foreach-Object { $versions.Add([String]::new($_)) } 
+  
+  $valid_vs_vers `
+  | Where-Object { ($versions -notcontains $_) -and ($(try {Test-Path([System.Environment]::GetEnvironmentVariable("VS" + $_.TrimEnd(".0") + "0COMNTOOLS"))} catch {$false})) } `
+  | Foreach-Object { $versions.Add([String]::new($_)) } 
+
+  $versions = $versions | sort {[float]$_} | Get-Unique
+  #>
+  $versions = (Get-VSVersionInfo)
+  if (-not $Latest) { return $versions }
+  @($versions) | Select-Object -Last 1
+}
+
+function Get-VCDir {
+  [CmdletBinding()]
+  param(
+    [ValidateSet("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0", "Latest")]
+    [Alias("v")]
+    [String]
+    $Version = "Latest"
+  )
+  $vs_ver = If ($Version -match "Latest") { $(Find-VSVersions -Latest) } Else { $Version }
+  $(try { Get-ItemPropertyValue "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\SxS\VS7" $vs_ver } catch {$null})
+}
 <#
   .SYNOPSIS
     Returns either *all* vcvarsall.bat files, a specific installed product's
@@ -13,20 +110,84 @@ function Find-VCVars {
     [Alias("p")]
     [String]
     $Product = "Any",
+    [ValidateSet("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0", "Latest")]
+    [Alias("v")]
+    [String]
+    $MSVC = "Latest",
+    [Alias("l")]
+    [Switch]
+    $Latest = $false,
+    [Switch]
+    $Legacy = $false
+  )
+
+  
+  $instances = $()
+  if(@("15.0", "Latest") -contains $MSVC) { $instances = Get-VSSetupInstance | Sort-Object -Property InstallDate | Where-Object { @([Path]::GetFileName($_.InstallationPath), "Any") -contains $Product } }
+  
+  if ($Latest) { $instances = $instances | Select-Object -Last 1 }
+  
+  if ($Legacy -or -not $instances) {
+    $instances = (Get-VSVersionInfo) | Where-Object { (@($_.Product, "Any") -contains $Product) -and (@($_.Version, "Latest") -contains $MSVC) }
+  }
+  $instances `
+  | ForEach-Object { $_.InstallationPath } `
+  | ForEach-Object { Get-ChildItem vcvarsall.bat -Path "$_\VC" -Recurse }
+}
+
+
+
+<#
+  .SYNOPSIS
+    Returns a list of all legacy Visual Studio installs
+
+function Find-VSLegacyInstall {
+  [CmdletBinding(DefaultParameterSetName="All")]
+  param(
+	[ValidateSet("Any", "2005", "2008", "2010", "2012", "2013", "2015")]
+    [Alias("v")]
+    [String]
+    $Year = "Any",
+    [ValidateSet("Any", "Community", "Professional", "Enterprise", "Express")]
+    [Alias("p")]
+    [String]
+    $Product = "Any",
     [Alias("l")]
     [Switch]
     $Latest = $false
   )
-
-  $instances = Get-VSSetupInstance | Sort-Object -Property InstallDate
-  if ($Latest) { $instances = $instances | Select-Object -Last 1 }
-
-  $instances `
-  | ForEach-Object { $_.InstallationPath } `
-  | Where-Object { @([Path]::GetFileName($_), "Any") -contains $Product } `
-  | ForEach-Object { Get-ChildItem vcvarsall.bat -Path "$_\VC" -Recurse }
+  
+ 
+  $msvc_search_versions = 
+	If ($Latest -or { @("Any", "All") -contains $Year })  { 
+		@("8","9","10","11","12","14") 
+	} Else {
+		switch -wildcard ($Year) {
+		"2005" { @(8) }
+		"2008" { @(9) }
+		"2010" { @(10) }
+		"2012" { @(11) }
+		"2013" { @(12) }
+		"2015" { @(14) }
+	}
+  $vs_sxs = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\SxS\VS7"
+  Get-Item $vs_sxs `
+  | Select-Object -ExpandProperty property `
+  | Where-Object { $msvc_search_versions -contains $_.TrimEnd(".0") } `
+  | Foreach-Object { }
+  
+  $10 = (Get-ItemProperty -Path $path).KitsRoot10
+  $8 = (Get-ItemProperty -Path $path).KitsRoot81
+  $versions = [List[Version]]::new()
+  Get-Item $8 `
+  | ForEach-Object { $versions.Add([Version]::new($_.Name)) }
+  Get-ChildItem "$10\Lib" `
+  | ForEach-Object { $versions.Add([Version]::new($_.Name)) }
+  if (-not $Latest) { return $versions }
+  $versions.Sort()
+  @($versions) | Select-Object -Last 1
 }
-
+#>
 <#
   .SYNOPSIS
     Returns a list of all installed Windows Kits SDKs
@@ -82,9 +243,15 @@ function Invoke-VCVars {
 
     [Alias("u")]
     [Switch]
-    $UWP = $false
+    $UWP = $false,
+    
+    [ValidateSet("8.0", "9.0", "10.0", "11.0", "12.0", "14.0", "15.0", "Latest")]
+    [Alias("v")]
+    [String]
+    $MSVC = "Latest"
   )
 
+  
   $hst = switch -wildcard ($HostArch) {
     "AMD64" { "amd64" }
     "x86" { "x86" }
@@ -98,7 +265,7 @@ function Invoke-VCVars {
   }
 
   $arch = if ($hst -ne $target) { "{0}_{1}" -f $hst, $target } else { $target }
-  $batch = (Find-VCVars $Product | Select-Object -Last 1).FullName
+  $batch = (Find-VCVars -Product $Product -MSVC $MSVC | Select-Object -Last 1).FullName
   $environment = @{}
   $current = @{}
 
@@ -233,6 +400,18 @@ Register-ArgumentCompleter `
   -CommandName Invoke-VCVars `
   -ParameterName SDK `
   -ScriptBlock $function:VCSDKArgumentCompletion
+
+function VSVersionArgumentCompletion {
+  param($command, $parameter, $word, $ast, $fake)
+  Find-VSVersions `
+  | Where-Object { $_ -like "*$word*" } `
+  | ForEach-Object { New-Object CompletionResult $_, $_, 'ParameterValue', $_ }
+}
+
+Register-ArgumentCompleter `
+  -CommandName Invoke-VCVars `
+  -ParameterName MSVC `
+  -ScriptBlock $function:VSVersionArgumentCompletion
 
 $script:VCVarsStack = New-Object Stack[HashTable]
 
